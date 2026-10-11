@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SC Summary – ملخص المقاولين</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  :root{--bg:#f5f7fa;--card:#fff;--text:#1f2937;--muted:#6b7280;--brand:#1f4e78;--line:#d9dee5;--tot:#ddebf7;--warn:#fff4e5;--ok:#e8f5e9}
+  @media (prefers-color-scheme:dark){:root{--bg:#111827;--card:#1f2937;--text:#e5e7eb;--muted:#9ca3af;--line:#374151;--tot:#1e3a5f;--warn:#3b2f1a;--ok:#1b3a26}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:"Segoe UI",Tahoma,Arial,sans-serif;line-height:1.5}
+  .wrap{max-width:1300px;margin:0 auto;padding:20px}
+  h1{margin:0 0 4px;color:var(--brand)} p.sub{margin:0 0 16px;color:var(--muted)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+  #drop{border:2px dashed var(--brand);border-radius:10px;padding:28px;text-align:center;cursor:pointer}
+  #drop.over{background:var(--tot)}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:12px}
+  input[type=text]{padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--text)}
+  button{background:var(--brand);color:#fff;border:0;border-radius:6px;padding:9px 16px;font-size:15px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  .tablebox{overflow-x:auto}
+  table{border-collapse:collapse;width:100%;font-size:14px}
+  th{background:var(--brand);color:#fff;padding:8px;position:sticky;top:0;white-space:nowrap}
+  td{border:1px solid var(--line);padding:6px 8px;white-space:nowrap}
+  td.n{text-align:left;direction:ltr;font-variant-numeric:tabular-nums}
+  td.nm{white-space:normal;min-width:260px}
+  tr.tot td{background:var(--tot);font-weight:700}
+  .warn{background:var(--warn)} .ok{background:var(--ok)}
+  .msg{padding:10px 12px;border-radius:8px;margin-bottom:10px}
+  ul{margin:6px 0;padding-inline-start:20px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>SC Summary – ملخص المقاولين</h1>
+  <p class="sub">ارفع ملف/ملفات SC_Invoices (xlsx) وهيتعمل جدول بكل مقاول. المعالجة كلها في المتصفح ومفيش بيانات بتتبعت لأي مكان.</p>
+
+  <div class="card">
+    <div id="drop">اسحب الملفات هنا أو اضغط للاختيار<input id="file" type="file" accept=".xlsx" multiple hidden></div>
+    <div class="row">
+      <label>اسم الشيت: <input type="text" id="sheet" value="SubContractor"></label>
+      <button id="dl" disabled>⬇️ تنزيل Excel</button>
+      <span id="status" class="sub"></span>
+    </div>
+  </div>
+
+  <div id="out" hidden>
+    <div id="checks"></div>
+    <div class="card tablebox"><table id="tbl"></table></div>
+  </div>
+</div>
+
+<script>
+//<core>
+const COL = {A:0,B:1,G:6,I:8,J:9,K:10,L:11,T:19,O:14,Q:16,S:18,U:20,V:21,W:22};
+const TOL = 0.01;
+const num = v => (typeof v === 'number' && isFinite(v)) ? v : 0;
+const cleanName = s => String(s).replace(/^\s*Subcontractor\s*Name\s*:?\s*/i,'').replace(/\s+/g,' ').trim();
+const fmt = n => n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+
+// rows: مصفوفة صفوف (index 0 = الصف 1 في الشيت)
+const NAME_RE  = /Subcontractor\s*Name|اسم\s*المقاول/i;
+const TOTAL_RE = /^(grand\s*)?total\s*:?$|^(ال)?[إا]جمالي\s*:?$|^المجموع\s*:?$/i;
+const findName = row => { for (let c=0;c<6;c++){ const v=row[c]; if (typeof v==='string' && NAME_RE.test(v)){
+    let nm = cleanName(v).replace(/^اسم\s*المقاول\s*:?\s*/,'');
+    if(!nm){ for(let k=c+1;k<row.length;k++){ if(typeof row[k]==='string' && row[k].trim()){ nm=row[k].trim(); break; } } }
+    return nm || '(بدون اسم)'; } } return null; };
+const isTotalRow = row => { for (let c=0;c<5;c++){ const v=row[c]; if (typeof v==='string' && TOTAL_RE.test(v.trim())) return true; } return false; };
+
+function parseRows(rows, source){
+  const blocks = [], issues = [];
+  let cur = null;
+  rows.forEach((row,i)=>{
+    const r = i+1;
+    const nm = findName(row);
+    if (nm!==null){
+      cur = {source, name:nm, start:r+1, rows:[], totalRow:null};
+      blocks.push(cur); return;
+    }
+    if (!cur) return;
+    if (isTotalRow(row)){ cur.totalRow=r; cur=null; return; }
+    const a = row[COL.A], b = row[COL.B];
+    const bs = b==null ? '' : String(b).trim();
+    const looksItem = typeof a==='number' || (bs && /^\d/.test(bs)) ||
+                      (typeof row[COL.O]==='number' && row[COL.O]!==0 && row[3]!=null);
+    if (looksItem) cur.rows.push(r);
+  });
+  const done = [];
+  blocks.forEach(blk=>{
+    if (!blk.rows.length){
+      if (blk.totalRow==null) issues.push([source,blk.name,blk.start,'مفيش بنود ولا صف Total تحت المقاول ده']);
+      else done.push(Object.assign(blk,{contract:0,work:0,prev:0,thisMonth:0,submitted:0,scRevenue:0,scRevenueCon:0,remaining:0,items:0,firstRow:'-',lastRow:'-'}));
+      return;
+    }
+    const g = c => blk.rows.reduce((s,r)=>s+num(rows[r-1][c]),0);
+    blk.contract=g(COL.O); blk.work=g(COL.U); blk.prev=g(COL.Q); blk.thisMonth=g(COL.S);
+    blk.submitted=g(COL.V); blk.scRevenue=g(COL.J); blk.scRevenueCon=g(COL.K);
+    blk.remaining = blk.work - blk.submitted;   // محسوبة (عمود W في الشيت مش موثوق)
+    blk.items = blk.rows.length;
+    blk.firstRow = blk.rows[0]; blk.lastRow = blk.rows[blk.rows.length-1];
+    if (blk.totalRow==null){
+      issues.push([source,blk.name,blk.lastRow,'مفيش صف Total للمقاول ده – الأرقام اتحسبت من البنود مباشرة']);
+      blk.totalRow = '-';
+    } else {
+      const t = rows[blk.totalRow-1];
+      [['Contract (O)',COL.O,blk.contract],['Total Accomplished (U)',COL.U,blk.work],
+       ['Submitted (V)',COL.V,blk.submitted],['SC Revenue (J)',COL.J,blk.scRevenue]].forEach(([l,c,mine])=>{
+        const st = num(t[c]);
+        if (Math.abs(st-mine)>TOL) issues.push([source,blk.name,blk.totalRow,`${l}: صف Total في الشيت = ${fmt(st)} لكن مجموع البنود = ${fmt(mine)}`]);
+      });
+      if (typeof t[COL.K]==='number'){
+        const kt=num(t[COL.K]);
+        if (Math.abs(kt-blk.scRevenueCon)>TOL) issues.push([source,blk.name,blk.totalRow,`SC Revenue against Contract (K): صف Total = ${fmt(kt)} لكن مجموع البنود = ${fmt(blk.scRevenueCon)}`]);
+      }
+      const sw = num(t[COL.W]);
+      if (Math.abs(sw-blk.remaining)>TOL) issues.push([source,blk.name,blk.totalRow,
+        `Remaining (W): صف Total في الشيت = ${fmt(sw)} لكن (Accomplished - Submitted) = ${fmt(blk.remaining)} → الأداة استخدمت القيمة المحسوبة`]);
+    }
+    blk.rows.forEach(r=>{
+      const x=rows[r-1], I=num(x[COL.I]), G=num(x[COL.G]), L=num(x[COL.L]), T=num(x[COL.T]);
+      if (Math.abs(I*G*T-num(x[COL.J]))>TOL) issues.push([source,blk.name,r,'SC Revenue (J) ≠ Total Accomplished Qty × SC% × Unit Price']);
+      if (Math.abs(I*G*L-num(x[COL.K]))>TOL) issues.push([source,blk.name,r,'SC Revenue against Contract (K) ≠ Qty SC Agreement × SC% × Unit Price']);
+      const q=num(x[COL.Q]), s=num(x[COL.S]), u=num(x[COL.U]);
+      if (Math.abs(q+s-u)>TOL) issues.push([source,blk.name,r,`البند: Previous + This Month = ${fmt(q+s)} لكن Total = ${fmt(u)}`]);
+      if (num(x[COL.V])-u>TOL) issues.push([source,blk.name,r,'Submitted أكبر من Total Accomplished في البند']);
+    });
+    done.push(blk);
+  });
+  return {blocks:done, issues};
+}
+
+function aggregate(blocks){
+  const m = new Map();
+  blocks.forEach(b=>{
+    const k = b.source+'||'+b.name;
+    if(!m.has(k)) m.set(k,{source:b.source,name:b.name,blocks:0,items:0,contract:0,work:0,submitted:0,remaining:0,scRevenue:0,scRevenueCon:0});
+    const a=m.get(k); a.blocks++; a.items+=b.items;
+    ['contract','work','submitted','remaining','scRevenue','scRevenueCon'].forEach(f=>a[f]+=b[f]);
+  });
+  return [...m.values()];
+}
+//</core>
+
+let ALL = {blocks:[], issues:[]};
+
+function readFile(file, sheetName){
+  return new Promise((res,rej)=>{
+    const fr = new FileReader();
+    fr.onload = e=>{
+      try{
+        const wb = XLSX.read(e.target.result,{type:'array',cellFormula:false,cellDates:false});
+        const norm = x=>String(x).replace(/\s+/g,'').toLowerCase();
+        const toRows = ws=>{
+          const rng = XLSX.utils.decode_range(ws['!ref']||'A1');
+          ws['!ref'] = XLSX.utils.encode_range({s:{r:0,c:0},e:rng.e});   // نبدأ من A1 عشان أرقام الصفوف تطابق الشيت
+          return XLSX.utils.sheet_to_json(ws,{header:1,defval:null,raw:true});
+        };
+        // 1) الاسم المطلوب (من غير حساسية للمسافات/الحروف)  2) أي شيت فيه "Subcontractor Name"
+        const cand = [];
+        const exact = wb.SheetNames.find(n=>norm(n)===norm(sheetName));
+        if (exact) cand.push(exact);
+        wb.SheetNames.forEach(n=>{ if(!cand.includes(n)) cand.push(n); });
+        let best = null, tried = [];
+        for (const n of cand){
+          const rows = toRows(wb.Sheets[n]);
+          const r = parseRows(rows,file.name);
+          if (r.blocks.length){ best = {r,n}; break; }
+          tried.push(n);
+          if (n===exact && !r.blocks.length) { /* كمل دور في باقي الشيتات */ }
+        }
+        if(!best){
+          res({blocks:[],issues:[[file.name,'-',0,`ماتلقيتش أي مقاول (سطر فيه "Subcontractor Name" وبعده بنود وصف Total) في أي شيت. الشيتات: ${wb.SheetNames.join(' | ')}`]]});
+          return;
+        }
+        if (norm(best.n)!==norm(sheetName)) best.r.issues.unshift([file.name,'-',0,`الشيت "${sheetName}" مش موجود أو فاضي – الأداة قرت من الشيت "${best.n}"`]);
+        res(best.r); return;
+
+      }catch(err){ rej(err); }
+    };
+    fr.onerror = ()=>rej(fr.error);
+    fr.readAsArrayBuffer(file);
+  });
+}
+
+async function handle(files){
+  const sheetName = document.getElementById('sheet').value.trim() || 'SubContractor';
+  const st = document.getElementById('status');
+  st.textContent = 'جاري القراءة...';
+  ALL = {blocks:[], issues:[]};
+  for (const f of files){
+    try{ const r = await readFile(f,sheetName); ALL.blocks.push(...r.blocks); ALL.issues.push(...r.issues); }
+    catch(e){ ALL.issues.push([f.name,'-',0,'خطأ في قراءة الملف: '+e.message]); }
+  }
+  st.textContent = '';
+  render();
+}
+
+function render(){
+  const out = document.getElementById('out');
+  const agg = aggregate(ALL.blocks);
+  out.hidden = false;
+  document.getElementById('dl').disabled = !agg.length;
+
+  const ch = document.getElementById('checks');
+  ch.innerHTML = (ALL.issues.length || !agg.length)
+    ? `<div class="msg warn"><b>${agg.length?`في ${ALL.issues.length} ملاحظة مراجعة:`:'مفيش جدول اتعمل:'}</b><ul>${ALL.issues.slice(0,30).map(i=>`<li>${esc(i[0])} – ${esc(i[1])} – صف ${i[2]}: ${esc(i[3])}</li>`).join('')}</ul>${ALL.issues.length>30?'<div>... والباقي في شيت Checks عند التنزيل</div>':''}</div>`
+    : `<div class="msg ok">كل الأرقام متطابقة مع صفوف Total في الشيت ✔</div>`;
+  if(!agg.length){ document.getElementById('tbl').innerHTML=''; return; }
+
+  const multi = new Set(agg.map(a=>a.source)).size>1;
+  const T = {contract:0,work:0,submitted:0,remaining:0,scRevenue:0,scRevenueCon:0};
+  agg.forEach(a=>Object.keys(T).forEach(k=>T[k]+=a[k]));
+  const ratio = (a,b)=>b? (a/b*100).toFixed(1)+'%':'0.0%';
+  const rowHtml = (cells)=>'<tr>'+cells+'</tr>';
+  const nc = v=>`<td class="n">${fmt(v)}</td>`;
+  let h = `<tr><th>#</th><th>اسم المقاول</th>${multi?'<th>الملف</th>':''}<th>قيمة العقد<br>SC Contract</th><th>إجمالي الأعمال المنجزة<br>Total Accomplished Work</th><th>Submitted</th><th>Remaining</th><th>SC Revenue<br>against SC Work</th><th>SC Revenue<br>against SC Contract</th><th>SC Work ÷ SC Contract</th><th>SC Revenue (Work) ÷ (Contract)</th></tr>`;
+  agg.forEach((a,i)=>{
+    h += rowHtml(`<td>${i+1}</td><td class="nm">${esc(a.name)}</td>${multi?`<td>${esc(a.source)}</td>`:''}${nc(a.contract)}${nc(a.work)}${nc(a.submitted)}${nc(a.remaining)}${nc(a.scRevenue)}${nc(a.scRevenueCon)}<td class="n">${ratio(a.work,a.contract)}</td><td class="n">${ratio(a.scRevenue,a.scRevenueCon)}</td>`);
+  });
+  h += `<tr class="tot"><td></td><td>الإجمالي</td>${multi?'<td></td>':''}${nc(T.contract)}${nc(T.work)}${nc(T.submitted)}${nc(T.remaining)}${nc(T.scRevenue)}${nc(T.scRevenueCon)}<td class="n">${ratio(T.work,T.contract)}</td><td class="n">${ratio(T.scRevenue,T.scRevenueCon)}</td></tr>`;
+  document.getElementById('tbl').innerHTML = h;
+}
+const esc = s => String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function download(){
+  const agg = aggregate(ALL.blocks);
+  const multi = new Set(agg.map(a=>a.source)).size>1;
+  const wb = XLSX.utils.book_new();
+
+  // Summary
+  const head = ['#','اسم المقاول',...(multi?['الملف']:[]),'قيمة العقد (SC Contract)','Total Accomplished Work','Submitted','Remaining','SC Revenue against SC Work','SC Revenue against SC Contract','SC Work / SC Contract','SC Revenue (Work) / (Contract)','عدد الـ Blocks'];
+  const pr=(a,b)=>b?a/b:0;
+  const rows = agg.map((a,i)=>[i+1,a.name,...(multi?[a.source]:[]),a.contract,a.work,a.submitted,a.remaining,a.scRevenue,a.scRevenueCon,pr(a.work,a.contract),pr(a.scRevenue,a.scRevenueCon),a.blocks]);
+  const T = k=>agg.reduce((s,a)=>s+a[k],0);
+  rows.push(['','الإجمالي',...(multi?['']:[]),T('contract'),T('work'),T('submitted'),T('remaining'),T('scRevenue'),T('scRevenueCon'),pr(T('work'),T('contract')),pr(T('scRevenue'),T('scRevenueCon')),'']);
+  const ws1 = XLSX.utils.aoa_to_sheet([head,...rows]);
+  const off = multi?1:0;
+  for(let r=1;r<=rows.length;r++){
+    for(let c=2+off;c<=7+off;c++){ const cell=ws1[XLSX.utils.encode_cell({r,c})]; if(cell) cell.z='#,##0.00'; }
+    for(const c of [8+off,9+off]){ const p=ws1[XLSX.utils.encode_cell({r,c})]; if(p) p.z='0.0%'; }
+  }
+  ws1['!cols']=[{wch:5},{wch:52},...(multi?[{wch:26}]:[]),{wch:20},{wch:24},{wch:18},{wch:18},{wch:24},{wch:24},{wch:16},{wch:20},{wch:10}];
+  ws1['!views']=[{RTL:true}];
+  XLSX.utils.book_append_sheet(wb,ws1,'Summary');
+
+  // By Block
+  const h2=['الملف','اسم المقاول','الصفوف في الشيت','عدد البنود','قيمة العقد','Total Accomplished','Submitted','Remaining','SC Revenue (Work)','SC Revenue (Contract)'];
+  const r2=ALL.blocks.map(b=>[b.source,b.name,`${b.firstRow}-${b.lastRow} (Total @ ${b.totalRow})`,b.items,b.contract,b.work,b.submitted,b.remaining,b.scRevenue,b.scRevenueCon]);
+  const ws2=XLSX.utils.aoa_to_sheet([h2,...r2]);
+  for(let r=1;r<=r2.length;r++) for(let c=4;c<=9;c++){const cell=ws2[XLSX.utils.encode_cell({r,c})]; if(cell) cell.z='#,##0.00';}
+  ws2['!cols']=[{wch:28},{wch:52},{wch:26},{wch:10},{wch:18},{wch:20},{wch:18},{wch:18},{wch:20},{wch:20}];
+  XLSX.utils.book_append_sheet(wb,ws2,'By Block');
+
+  // Checks
+  const ws3=XLSX.utils.aoa_to_sheet(ALL.issues.length?[['الملف','المقاول','رقم الصف','الملاحظة'],...ALL.issues]:[['كل الأرقام متطابقة مع صفوف Total في الشيت']]);
+  ws3['!cols']=[{wch:28},{wch:50},{wch:10},{wch:110}];
+  XLSX.utils.book_append_sheet(wb,ws3,'Checks');
+
+  XLSX.writeFile(wb,'SC_Summary.xlsx');
+}
+
+const drop=document.getElementById('drop'), fileInput=document.getElementById('file');
+drop.addEventListener('click',()=>fileInput.click());
+fileInput.addEventListener('change',()=>fileInput.files.length&&handle([...fileInput.files]));
+['dragover','dragenter'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over')}));
+['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('over')}));
+drop.addEventListener('drop',e=>{const fs=[...e.dataTransfer.files].filter(f=>/\.xlsx$/i.test(f.name)); if(fs.length) handle(fs);});
+document.getElementById('dl').addEventListener('click',download);
+</script>
+</body>
+</html>
