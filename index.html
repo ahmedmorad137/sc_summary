@@ -53,13 +53,12 @@
 
 <script>
 //<core>
-const COL = {A:0,B:1,G:6,I:8,J:9,K:10,L:11,T:19,O:14,Q:16,S:18,U:20,V:21,W:22};
 const TOL = 0.01;
 const num = v => (typeof v === 'number' && isFinite(v)) ? v : 0;
 const cleanName = s => String(s).replace(/^\s*Subcontractor\s*Name\s*:?\s*/i,'').replace(/\s+/g,' ').trim();
 const fmt = n => n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+const norm = v => typeof v==='string' ? v.replace(/\s+/g,' ').trim().toLowerCase() : '';
 
-// rows: مصفوفة صفوف (index 0 = الصف 1 في الشيت)
 const NAME_RE  = /Subcontractor\s*Name|اسم\s*المقاول/i;
 const TOTAL_RE = /^(grand\s*)?total\s*:?$|^(ال)?[إا]جمالي\s*:?$|^المجموع\s*:?$/i;
 const findName = row => { for (let c=0;c<6;c++){ const v=row[c]; if (typeof v==='string' && NAME_RE.test(v)){
@@ -68,35 +67,79 @@ const findName = row => { for (let c=0;c<6;c++){ const v=row[c]; if (typeof v===
     return nm || '(بدون اسم)'; } } return null; };
 const isTotalRow = row => { for (let c=0;c<5;c++){ const v=row[c]; if (typeof v==='string' && TOTAL_RE.test(v.trim())) return true; } return false; };
 
+// تحديد أماكن الأعمدة من صفوف العناوين (صف المجموعات + الصف اللي تحته) بدل أماكن ثابتة،
+// عشان أي مشروع بترتيب أعمدة مختلف يتقرا صح.
+function detectCols(rows, hr){
+  const h = rows[hr]||[], sub = rows[hr+1]||[];
+  const n = Math.max(h.length, sub.length);
+  const starts = [];
+  for (let c=0;c<n;c++){ const t=norm(h[c]); if (t) starts.push([c,t]); }
+  const rangeOf = re => { const i=starts.findIndex(([,t])=>re.test(t)); if(i<0) return null;
+    return [starts[i][0], i+1<starts.length ? starts[i+1][0]-1 : n-1]; };
+  const find = (rg,re) => { if(!rg) return -1; for(let c=rg[0];c<=rg[1];c++) if(re.test(norm(sub[c]))) return c; return -1; };
+  const agr = rangeOf(/subcontractor\s*agreement/);
+  if(!agr) return null;
+  const con  = rangeOf(/^contract$/) || [0, agr[0]-1];
+  const prev = rangeOf(/accomplished\s*work\s*previous/);
+  const cur  = rangeOf(/accomplished\s*work\s*this\s*month/);
+  const tot  = rangeOf(/^total\s*accomplished\s*work/);
+  const inv  = rangeOf(/invoices?\s*status/);
+  const cm = {
+    G:find(con,/unit\s*price/), I:find(con,/^sc\s*%$/), J:find(con,/^sc\s*revenue/),
+    aQty:find(agr,/^quantity$/), aPrice:find(agr,/unit\s*price/), aTotal:find(agr,/total\s*amount/),
+    pTotal:find(prev,/^total$/), tTotal:find(cur,/^total$/),
+    uQty:find(tot,/^quantity$/), uTotal:find(tot,/^total$/),
+    sub:find(inv,/submitted/), rem:find(inv,/remaining/)
+  };
+  const labels = {G:'Unit Price (Contract)',I:'sc %',J:'SC Revenue',aQty:'Agreement Quantity',aTotal:'Agreement Total Amount',uQty:'TOTAL Accomplished Quantity',uTotal:'TOTAL Accomplished Total',sub:'Submitted'};
+  const missing = Object.keys(labels).filter(k=>cm[k]<0).map(k=>labels[k]);
+  return {cm, missing};
+}
+const colName = i => { let s='',n=i+1; while(n>0){ const m=(n-1)%26; s=String.fromCharCode(65+m)+s; n=Math.floor((n-1)/26);} return s; };
+
+// rows: مصفوفة صفوف (index 0 = الصف 1 في الشيت)
 function parseRows(rows, source){
   const blocks = [], issues = [];
-  let cur = null;
+  let cm = null, cur = null;
   rows.forEach((row,i)=>{
     const r = i+1;
+    if (row.some(v=>typeof v==='string' && /subcontractor\s*agreement/i.test(v))){
+      const d = detectCols(rows,i);
+      if (d && d.missing.length){ issues.push([source,'-',r,'مش لاقي الأعمدة دي في العناوين: '+d.missing.join(' | ')]); cm = null; }
+      else if (d){ cm = d.cm; }
+      cur = null; return;
+    }
     const nm = findName(row);
     if (nm!==null){
-      cur = {source, name:nm, start:r+1, rows:[], totalRow:null};
+      cur = {source, name:nm, start:r+1, rows:[], totalRow:null, cm};
       blocks.push(cur); return;
     }
     if (!cur) return;
     if (isTotalRow(row)){ cur.totalRow=r; cur=null; return; }
-    const a = row[COL.A], b = row[COL.B];
+    if (!cur.cm) return;
+    const a = row[0], b = row[1];
     const bs = b==null ? '' : String(b).trim();
     const looksItem = typeof a==='number' || (bs && /^\d/.test(bs)) ||
-                      (typeof row[COL.O]==='number' && row[COL.O]!==0 && row[3]!=null);
+                      (typeof row[cur.cm.aTotal]==='number' && row[cur.cm.aTotal]!==0 && row[3]!=null);
     if (looksItem) cur.rows.push(r);
   });
   const done = [];
   blocks.forEach(blk=>{
+    if (!blk.cm){ issues.push([source,blk.name,blk.start,'مفيش صف عناوين (Subcontractor Agreement ...) قبل المقاول ده – مقدرتش أحدد الأعمدة']); return; }
+    const k = blk.cm;
     if (!blk.rows.length){
       if (blk.totalRow==null) issues.push([source,blk.name,blk.start,'مفيش بنود ولا صف Total تحت المقاول ده']);
       else done.push(Object.assign(blk,{contract:0,work:0,prev:0,thisMonth:0,submitted:0,scRevenue:0,scRevenueCon:0,remaining:0,items:0,firstRow:'-',lastRow:'-'}));
       return;
     }
-    const g = c => blk.rows.reduce((s,r)=>s+num(rows[r-1][c]),0);
-    blk.contract=g(COL.O); blk.work=g(COL.U); blk.prev=g(COL.Q); blk.thisMonth=g(COL.S);
-    blk.submitted=g(COL.V); blk.scRevenue=g(COL.J); blk.scRevenueCon=g(COL.K);
-    blk.remaining = blk.work - blk.submitted;   // محسوبة (عمود W في الشيت مش موثوق)
+    const g = c => c<0 ? 0 : blk.rows.reduce((s,r)=>s+num(rows[r-1][c]),0);
+    blk.contract = g(k.aTotal);            // قيمة عقد المقاول (Subcontractor Agreement – Total Amount)
+    blk.work = g(k.uTotal);                // TOTAL Accomplished work – amount
+    blk.prev = g(k.pTotal); blk.thisMonth = g(k.tTotal);
+    blk.submitted = g(k.sub);
+    blk.scRevenue = g(k.J);                // SC Revenue = Qty المنجز × SC% × Unit Price العقد (من الشيت)
+    blk.scRevenueCon = blk.rows.reduce((s,r)=>{const x=rows[r-1]; return s+num(x[k.aQty])*num(x[k.I])*num(x[k.G]);},0); // Qty في SC Agreement × SC% × Unit Price العقد
+    blk.remaining = blk.work - blk.submitted;
     blk.items = blk.rows.length;
     blk.firstRow = blk.rows[0]; blk.lastRow = blk.rows[blk.rows.length-1];
     if (blk.totalRow==null){
@@ -104,26 +147,25 @@ function parseRows(rows, source){
       blk.totalRow = '-';
     } else {
       const t = rows[blk.totalRow-1];
-      [['Contract (O)',COL.O,blk.contract],['Total Accomplished (U)',COL.U,blk.work],
-       ['Submitted (V)',COL.V,blk.submitted],['SC Revenue (J)',COL.J,blk.scRevenue]].forEach(([l,c,mine])=>{
+      [[`Contract (${colName(k.aTotal)})`,k.aTotal,blk.contract],[`Total Accomplished (${colName(k.uTotal)})`,k.uTotal,blk.work],
+       [`Submitted (${colName(k.sub)})`,k.sub,blk.submitted],[`SC Revenue (${colName(k.J)})`,k.J,blk.scRevenue]].forEach(([l,c,mine])=>{
         const st = num(t[c]);
         if (Math.abs(st-mine)>TOL) issues.push([source,blk.name,blk.totalRow,`${l}: صف Total في الشيت = ${fmt(st)} لكن مجموع البنود = ${fmt(mine)}`]);
       });
-      if (typeof t[COL.K]==='number'){
-        const kt=num(t[COL.K]);
-        if (Math.abs(kt-blk.scRevenueCon)>TOL) issues.push([source,blk.name,blk.totalRow,`SC Revenue against Contract (K): صف Total = ${fmt(kt)} لكن مجموع البنود = ${fmt(blk.scRevenueCon)}`]);
+      if (k.rem>=0){
+        const sw = num(t[k.rem]);
+        if (Math.abs(sw-blk.remaining)>TOL) issues.push([source,blk.name,blk.totalRow,
+          `Remaining (${colName(k.rem)}): صف Total في الشيت = ${fmt(sw)} لكن (Accomplished - Submitted) = ${fmt(blk.remaining)} → الأداة استخدمت القيمة المحسوبة`]);
       }
-      const sw = num(t[COL.W]);
-      if (Math.abs(sw-blk.remaining)>TOL) issues.push([source,blk.name,blk.totalRow,
-        `Remaining (W): صف Total في الشيت = ${fmt(sw)} لكن (Accomplished - Submitted) = ${fmt(blk.remaining)} → الأداة استخدمت القيمة المحسوبة`]);
     }
     blk.rows.forEach(r=>{
-      const x=rows[r-1], I=num(x[COL.I]), G=num(x[COL.G]), L=num(x[COL.L]), T=num(x[COL.T]);
-      if (Math.abs(I*G*T-num(x[COL.J]))>TOL) issues.push([source,blk.name,r,'SC Revenue (J) ≠ Total Accomplished Qty × SC% × Unit Price']);
-      if (Math.abs(I*G*L-num(x[COL.K]))>TOL) issues.push([source,blk.name,r,'SC Revenue against Contract (K) ≠ Qty SC Agreement × SC% × Unit Price']);
-      const q=num(x[COL.Q]), s=num(x[COL.S]), u=num(x[COL.U]);
-      if (Math.abs(q+s-u)>TOL) issues.push([source,blk.name,r,`البند: Previous + This Month = ${fmt(q+s)} لكن Total = ${fmt(u)}`]);
-      if (num(x[COL.V])-u>TOL) issues.push([source,blk.name,r,'Submitted أكبر من Total Accomplished في البند']);
+      const x=rows[r-1], I=num(x[k.I]), G=num(x[k.G]), uq=num(x[k.uQty]), u=num(x[k.uTotal]);
+      if (Math.abs(I*G*uq-num(x[k.J]))>TOL) issues.push([source,blk.name,r,'SC Revenue ≠ Total Accomplished Qty × SC% × Unit Price']);
+      if (k.aPrice>=0 && Math.abs(num(x[k.aQty])*num(x[k.aPrice])-num(x[k.aTotal]))>TOL)
+        issues.push([source,blk.name,r,'Agreement Total Amount ≠ Quantity × Unit Price']);
+      if (k.pTotal>=0 && k.tTotal>=0 && Math.abs(num(x[k.pTotal])+num(x[k.tTotal])-u)>TOL)
+        issues.push([source,blk.name,r,`البند: Previous + This Month = ${fmt(num(x[k.pTotal])+num(x[k.tTotal]))} لكن Total = ${fmt(u)}`]);
+      if (num(x[k.sub])-u>TOL) issues.push([source,blk.name,r,'Submitted أكبر من Total Accomplished في البند']);
     });
     done.push(blk);
   });
